@@ -1,0 +1,52 @@
+# Audio sample generation callback configuration.
+#
+# Add this callback to a training run by appending it to the callbacks dict:
+#
+#   python fish_speech/train.py \
+#       --config-name text2semantic_finetune \
+#       +callbacks.audio_sample=fish_speech/configs/audio_sample_callback.yaml \
+#       callbacks.audio_sample.prompt_tokens_path=data/reference_speaker.npy \
+#       callbacks.audio_sample.prompt_text="Transcript of the reference clip."
+#
+# Or merge it directly into your own training YAML (see below).
+#
+# The callback saves wav files under:
+#   <output_dir>/step_XXXXXXXX/sample_00.wav
+#   <output_dir>/step_XXXXXXXX/sample_01.wav
+#   ...
+#
+# You can track quality by listening to these samples as training progresses.
+# -------------------------------------------------------------------------
+
+_target_: fish_speech.callbacks.AudioSampleCallback
+
+# Path to the VQGAN codec weights (inside the base model checkpoint directory)
+codec_checkpoint_path: ${pretrained_ckpt_path}/codec.pth
+
+# Test sentences to synthesise at every checkpoint.
+# Use sentences that cover a range of phonemes in your target language.
+sentences:
+  - "Nĩngũkuũhia mwĩgĩ gwakwa."
+  - "Tũrĩ na ũhoro wa kũhanda mĩgũnda ĩno yothe."
+  - "Mwana wa mbũri ndagĩa thĩinĩ wa nyũmba."
+
+# Transcript of the reference speaker clip (used for voice conditioning).
+# Must match the audio in prompt_tokens_path exactly.
+prompt_text: "REPLACE_WITH_REFERENCE_TRANSCRIPT"
+
+# Path to the .npy file of VQ tokens from the reference speaker clip.
+# Generate with: python fish_speech/tools/vqgan/extract_vq.py reference.wav ...
+prompt_tokens_path: "REPLACE_WITH_PATH_TO_REFERENCE_NPY"
+
+# Directory where per-step sample folders are created.
+output_dir: ${paths.output_dir}/audio_samples
+
+# How often to generate samples (in training steps).
+sample_every_n_steps: 100
+
+# Sampling parameters
+temperature: 0.7
+top_p: 0.8
+top_k: 30
+repetition_penalty: 1.3
+max_new_tokens: 500
