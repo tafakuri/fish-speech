@@ -359,8 +359,48 @@ def generate(
     return seq
 
 
-def init_model(checkpoint_path, device, precision, compile=False):
+def load_lora_adapter(model, lora_checkpoint: Path, lora_config):
+    """Apply a LoRA adapter checkpoint onto an already-loaded base model.
+
+    Critical ordering: ``setup_lora()`` replaces embedding/linear layers with
+    new loralib objects, which re-initialises their ``.weight`` to random values.
+    We must snapshot the pre-trained base weights first, then restore them after
+    setup_lora, then overlay the LoRA A/B matrices from the checkpoint.
+    """
+    from fish_speech.models.text2semantic.lora import setup_lora
+
+    # 1. Snapshot base weights before setup_lora destroys them
+    base_sd = {k: v.clone() for k, v in model.state_dict().items()}
+
+    # 2. Replace layers with loralib equivalents (randomly re-inits .weight)
+    setup_lora(model, lora_config)
+    logger.info(f"LoRA layers initialised: r={lora_config.r}, alpha={lora_config.lora_alpha}")
+
+    # 3. Restore base weights into the new loralib layers
+    model.load_state_dict(base_sd, strict=False)
+
+    # 4. Load LoRA adapter weights (lora_A / lora_B only)
+    raw = torch.load(lora_checkpoint, map_location="cpu", weights_only=False)
+    # Lightning checkpoints wrap weights under a 'state_dict' key whose names
+    # carry a leading 'model.' prefix (from the LightningModule wrapper).
+    sd = raw.get("state_dict", raw)
+    sd = {(k[len("model."):] if k.startswith("model.") else k): v for k, v in sd.items()}
+
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    lora_missing = [k for k in missing if "lora" in k]
+    if lora_missing:
+        logger.warning(f"Missing LoRA keys after load: {lora_missing}")
+    logger.info(f"Loaded LoRA adapter from {lora_checkpoint} "
+                f"({len(sd)} keys, {len(unexpected)} unexpected, {len(missing)} missing)")
+
+
+def init_model(checkpoint_path, device, precision, compile=False,
+               lora_config=None, lora_checkpoint: Path | None = None):
     model = DualARTransformer.from_pretrained(checkpoint_path, load_weights=True)
+
+    if lora_config is not None and lora_checkpoint is not None:
+        load_lora_adapter(model, lora_checkpoint, lora_config)
+        logger.info("LoRA adapter applied — running in adapter mode (base weights frozen)")
 
     model = model.to(device=device, dtype=precision)
     logger.info(f"Restored model from checkpoint")
@@ -750,13 +790,16 @@ def launch_thread_safe_queue(
     device,
     precision,
     compile: bool = False,
+    lora_config=None,
+    lora_checkpoint: Path | None = None,
 ):
     input_queue = queue.Queue()
     init_event = threading.Event()
 
     def worker():
         model, decode_one_token = init_model(
-            checkpoint_path, device, precision, compile=compile
+            checkpoint_path, device, precision, compile=compile,
+            lora_config=lora_config, lora_checkpoint=lora_checkpoint,
         )
         with torch.device(device):
             model.setup_caches(
@@ -836,6 +879,15 @@ def launch_thread_safe_queue(
 @click.option("--iterative-prompt/--no-iterative-prompt", default=True)
 @click.option("--chunk-length", type=int, default=300)
 @click.option("--output-dir", type=Path, default="output")
+@click.option(
+    "--lora-checkpoint",
+    type=click.Path(path_type=Path, exists=True),
+    default=None,
+    help="Path to a LoRA adapter .ckpt file (Lightning checkpoint). "
+         "When set, the adapter is applied on top of --checkpoint-path without merging.",
+)
+@click.option("--lora-r", type=int, default=8, help="LoRA rank (must match the trained adapter).")
+@click.option("--lora-alpha", type=float, default=16.0, help="LoRA alpha (must match the trained adapter).")
 def main(
     text: str,
     prompt_text: Optional[tuple[str, ...]],
@@ -855,6 +907,9 @@ def main(
     iterative_prompt: bool,
     chunk_length: int,
     output_dir: Path,
+    lora_checkpoint: Optional[Path],
+    lora_r: int,
+    lora_alpha: float,
 ) -> None:
     os.makedirs(output_dir, exist_ok=True)
     precision = torch.half if half else torch.bfloat16
@@ -874,8 +929,13 @@ def main(
 
     logger.info("Loading model ...")
     t0 = time.time()
+    lora_cfg = None
+    if lora_checkpoint is not None:
+        from fish_speech.models.text2semantic.lora import LoraConfig
+        lora_cfg = LoraConfig(r=lora_r, lora_alpha=lora_alpha)
     model, decode_one_token = init_model(
-        checkpoint_path, device, precision, compile=compile
+        checkpoint_path, device, precision, compile=compile,
+        lora_config=lora_cfg, lora_checkpoint=lora_checkpoint,
     )
     with torch.device(device):
         model.setup_caches(

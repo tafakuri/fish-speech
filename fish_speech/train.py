@@ -107,6 +107,24 @@ def train(cfg: DictConfig) -> tuple[dict, dict]:
             log.info(f"Error loading state dict: {err}")
             ckpt_path = None
 
+        # For LoRA checkpoints (auto-resume), base weights are not stored in the checkpoint.
+        # Detect this case and patch the checkpoint state_dict with current base weights so
+        # Lightning can restore the full state (optimizer, step counter) without strict errors.
+        if auto_resume and ckpt_path is not None:
+            tmp_ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            sd = tmp_ckpt.get("state_dict", {})
+            if sd and all("lora" in k.lower() for k in sd.keys()):
+                log.info("LoRA-only checkpoint detected — merging base weights for full resume.")
+                full_sd = {k: v for k, v in model.state_dict().items()}
+                full_sd.update(sd)
+                tmp_ckpt["state_dict"] = full_sd
+                import tempfile
+                tmp_file = tempfile.NamedTemporaryFile(suffix=".ckpt", delete=False)
+                tmp_file.close()
+                torch.save(tmp_ckpt, tmp_file.name)
+                ckpt_path = tmp_file.name
+                log.info(f"Saved merged checkpoint to {tmp_file.name}")
+
         trainer.fit(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
 
     train_metrics = trainer.callback_metrics
